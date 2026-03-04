@@ -1,9 +1,9 @@
+// server.js
 require("dotenv").config();
 
 const express = require("express");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
-const fetch = require("node-fetch");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -18,6 +18,14 @@ function requireEnv(name) {
   const v = (process.env[name] || "").trim();
   if (!v) throw new Error(`Missing env: ${name}`);
   return v;
+}
+
+function getFetch() {
+  const f = globalThis.fetch;
+  if (typeof f !== "function") {
+    throw new Error("fetch is not a function (Node runtime has no global fetch)");
+  }
+  return f;
 }
 
 function getSupabaseAdmin() {
@@ -51,12 +59,12 @@ app.post("/render-mp4", async (req, res) => {
     const audioPath = path.join(tmpDir, "audio.mp3");
     const videoPath = path.join(tmpDir, "video.mp4");
 
-    // download audio
-    const audioResp = await fetch(audioUrl);
+    // download audio (Node 22: use global fetch)
+    const audioResp = await getFetch()(audioUrl);
     if (!audioResp.ok) {
       return res.status(400).json({ error: `audio_download_failed_${audioResp.status}` });
     }
-    const audioBuffer = await audioResp.buffer();
+    const audioBuffer = Buffer.from(await audioResp.arrayBuffer());
     fs.writeFileSync(audioPath, audioBuffer);
 
     // render simple video (black background + audio)
