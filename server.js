@@ -1,4 +1,3 @@
-// server.js
 require("dotenv").config();
 
 const express = require("express");
@@ -20,14 +19,6 @@ function requireEnv(name) {
   return v;
 }
 
-function getFetch() {
-  const f = globalThis.fetch;
-  if (typeof f !== "function") {
-    throw new Error("fetch is not a function (Node runtime has no global fetch)");
-  }
-  return f;
-}
-
 function getSupabaseAdmin() {
   const url = requireEnv("SUPABASE_URL");
   const key = requireEnv("SUPABASE_SERVICE_ROLE_KEY");
@@ -37,14 +28,26 @@ function getSupabaseAdmin() {
   });
 }
 
+// 1x1 PNG negru (fără lavfi)
+const BLACK_PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO1k3u0AAAAASUVORK5CYII=";
+
+function getBearerToken(req) {
+  const h = (req.headers.authorization || "").trim();
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return (m?.[1] || "").trim();
+}
+
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "idive-video-worker" });
 });
 
 app.post("/render-mp4", async (req, res) => {
+  let tmpDir = null;
+
   try {
-    const secret = (req.headers.authorization || "").replace("Bearer ", "").trim();
-    if (secret !== requireEnv("VIDEO_RENDERER_SECRET")) {
+    const secret = getBearerToken(req);
+    if (!secret || secret !== requireEnv("VIDEO_RENDERER_SECRET")) {
       return res.status(401).json({ error: "unauthorized" });
     }
 
@@ -55,25 +58,37 @@ app.post("/render-mp4", async (req, res) => {
 
     const supabase = getSupabaseAdmin();
 
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "idive-video-"));
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "idive-video-"));
     const audioPath = path.join(tmpDir, "audio.mp3");
+    const stillPath = path.join(tmpDir, "black.png");
     const videoPath = path.join(tmpDir, "video.mp4");
 
-    // download audio (Node 22: use global fetch)
-    const audioResp = await getFetch()(audioUrl);
+    // 1) download audio (folosim fetch global din Node 22)
+    const audioResp = await fetch(audioUrl);
     if (!audioResp.ok) {
       return res.status(400).json({ error: `audio_download_failed_${audioResp.status}` });
     }
     const audioBuffer = Buffer.from(await audioResp.arrayBuffer());
     fs.writeFileSync(audioPath, audioBuffer);
 
-    // render simple video (black background + audio)
+    // 2) write black png
+    fs.writeFileSync(stillPath, Buffer.from(BLACK_PNG_BASE64, "base64"));
+
+    // 3) render mp4 (fără lavfi)
     await new Promise((resolve, reject) => {
       ffmpeg()
-        .input("color=c=black:s=1080x1080:d=30")
-        .inputFormat("lavfi")
+        .input(stillPath)
+        .inputOptions(["-loop 1", "-framerate 30"])
         .input(audioPath)
-        .outputOptions(["-c:v libx264", "-c:a aac", "-shortest", "-pix_fmt yuv420p"])
+        .outputOptions([
+          "-c:v libx264",
+          "-tune stillimage",
+          "-vf scale=1080:1080,format=yuv420p",
+          "-c:a aac",
+          "-b:a 192k",
+          "-shortest",
+          "-movflags +faststart",
+        ])
         .save(videoPath)
         .on("end", resolve)
         .on("error", reject);
@@ -81,17 +96,18 @@ app.post("/render-mp4", async (req, res) => {
 
     const videoBuffer = fs.readFileSync(videoPath);
 
-    // upload mp4
+    // 4) upload mp4
     const { error: uploadErr } = await supabase.storage
       .from(output.bucket)
       .upload(output.path, videoBuffer, {
         contentType: "video/mp4",
         upsert: true,
+        cacheControl: "3600",
       });
 
     if (uploadErr) throw uploadErr;
 
-    // signed URL 7 days
+    // 5) signed URL 7 days
     const { data: signed, error: signErr } = await supabase.storage
       .from(output.bucket)
       .createSignedUrl(output.path, 60 * 60 * 24 * 7);
@@ -100,7 +116,7 @@ app.post("/render-mp4", async (req, res) => {
 
     const mp4Url = signed?.signedUrl || null;
 
-    // insert asset (best-effort)
+    // 6) insert asset (best-effort)
     try {
       await supabase.from("video_assets").insert({
         job_id: jobId,
@@ -110,14 +126,19 @@ app.post("/render-mp4", async (req, res) => {
         storage_bucket: output.bucket,
         storage_path: output.path,
         public_url: mp4Url,
-        meta: { engine: "ffmpeg_v1" },
+        meta: { engine: "ffmpeg_stillimage_v2", size: "1080x1080", fps: 30 },
       });
     } catch {}
 
-    res.json({ ok: true, mp4Url });
+    return res.json({ ok: true, mp4Url });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e?.message || "internal_error" });
+    return res.status(500).json({ error: e?.message || "internal_error" });
+  } finally {
+    // cleanup best-effort
+    try {
+      if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {}
   }
 });
 
