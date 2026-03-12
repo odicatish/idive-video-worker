@@ -154,6 +154,169 @@ async function downloadToFile(url, outPath) {
   return { contentType, size: buffer.length };
 }
 
+function getLocalBackgroundVideoPath() {
+  const p = path.join(__dirname, "assets", "background.mp4");
+  return fs.existsSync(p) ? p : null;
+}
+
+function renderWithLocalBackgroundVideo({
+  backgroundPath,
+  stillPath,
+  audioPath,
+  videoPath,
+}) {
+  return new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(backgroundPath)
+      .inputOptions(["-stream_loop", "-1"])
+      .input(stillPath)
+      .inputOptions(["-loop 1", "-framerate 30"])
+      .input(audioPath)
+      .complexFilter([
+        {
+          filter: "scale",
+          options: "1080:1920:force_original_aspect_ratio=increase",
+          inputs: "0:v",
+          outputs: "bgscaled",
+        },
+        {
+          filter: "crop",
+          options: "1080:1920",
+          inputs: "bgscaled",
+          outputs: "bgcropped",
+        },
+        {
+          filter: "eq",
+          options: "brightness=-0.08:saturation=0.90",
+          inputs: "bgcropped",
+          outputs: "bg",
+        },
+        {
+          filter: "scale",
+          options: "920:1600:force_original_aspect_ratio=decrease",
+          inputs: "1:v",
+          outputs: "fgscaled",
+        },
+        {
+          filter: "pad",
+          options: "920:1600:(ow-iw)/2:(oh-ih)/2:color=black@0.0",
+          inputs: "fgscaled",
+          outputs: "fg",
+        },
+        {
+          filter: "overlay",
+          options: "(W-w)/2:(H-h)/2",
+          inputs: ["bg", "fg"],
+          outputs: "composite",
+        },
+        {
+          filter: "format",
+          options: "yuv420p",
+          inputs: "composite",
+          outputs: "vfinal",
+        },
+      ])
+      .outputOptions([
+        "-map [vfinal]",
+        "-map 2:a:0",
+        "-c:v libx264",
+        "-preset medium",
+        "-crf 20",
+        "-r 30",
+        "-pix_fmt yuv420p",
+        "-c:a aac",
+        "-b:a 192k",
+        "-shortest",
+        "-movflags +faststart",
+      ])
+      .save(videoPath)
+      .on("end", resolve)
+      .on("error", reject);
+  });
+}
+
+function renderWithCinematicStillBackground({
+  stillPath,
+  audioPath,
+  videoPath,
+}) {
+  return new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(stillPath)
+      .inputOptions(["-loop 1", "-framerate 30"])
+      .input(stillPath)
+      .inputOptions(["-loop 1", "-framerate 30"])
+      .input(audioPath)
+      .complexFilter([
+        {
+          filter: "zoompan",
+          options: {
+            z: "min(zoom+0.00025,1.06)",
+            x: "iw/2-(iw/zoom/2)",
+            y: "ih/2-(ih/zoom/2)",
+            d: 1,
+            s: "1080x1920",
+            fps: 30,
+          },
+          inputs: "0:v",
+          outputs: "bgzoom",
+        },
+        {
+          filter: "boxblur",
+          options: "25:10",
+          inputs: "bgzoom",
+          outputs: "bgblur",
+        },
+        {
+          filter: "eq",
+          options: "brightness=-0.10:saturation=0.85",
+          inputs: "bgblur",
+          outputs: "bg",
+        },
+        {
+          filter: "scale",
+          options: "920:1600:force_original_aspect_ratio=decrease",
+          inputs: "1:v",
+          outputs: "fgscaled",
+        },
+        {
+          filter: "pad",
+          options: "920:1600:(ow-iw)/2:(oh-ih)/2:color=black@0.0",
+          inputs: "fgscaled",
+          outputs: "fg",
+        },
+        {
+          filter: "overlay",
+          options: "(W-w)/2:(H-h)/2",
+          inputs: ["bg", "fg"],
+          outputs: "composite",
+        },
+        {
+          filter: "format",
+          options: "yuv420p",
+          inputs: "composite",
+          outputs: "vfinal",
+        },
+      ])
+      .outputOptions([
+        "-map [vfinal]",
+        "-map 2:a:0",
+        "-c:v libx264",
+        "-preset medium",
+        "-crf 20",
+        "-r 30",
+        "-pix_fmt yuv420p",
+        "-c:a aac",
+        "-b:a 192k",
+        "-shortest",
+        "-movflags +faststart",
+      ])
+      .save(videoPath)
+      .on("end", resolve)
+      .on("error", reject);
+  });
+}
+
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "idive-video-worker" });
 });
@@ -179,7 +342,6 @@ app.post("/render-mp4", async (req, res) => {
     const audioPath = path.join(tmpDir, "audio.mp3");
     const videoPath = path.join(tmpDir, "video.mp4");
 
-    // 1) download audio
     const audioResp = await fetch(audioUrl);
     if (!audioResp.ok) {
       return res.status(400).json({ error: `audio_download_failed_${audioResp.status}` });
@@ -187,92 +349,30 @@ app.post("/render-mp4", async (req, res) => {
     const audioBuffer = Buffer.from(await audioResp.arrayBuffer());
     fs.writeFileSync(audioPath, audioBuffer);
 
-    // 2) resolve presenter image
     const presenterImageUrl = await getPresenterImageUrl(supabase, jobId);
     const imageExt = guessImageExt("", presenterImageUrl);
     const stillPath = path.join(tmpDir, `presenter${imageExt}`);
     const imageMeta = await downloadToFile(presenterImageUrl, stillPath);
 
-    // 3) render mp4 with cinematic background + subtle motion
-    await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(stillPath)
-        .inputOptions(["-loop 1", "-framerate 30"])
-        .input(stillPath)
-        .inputOptions(["-loop 1", "-framerate 30"])
-        .input(audioPath)
-        .complexFilter([
-          {
-            filter: "zoompan",
-            options: {
-              z: "min(zoom+0.00025,1.06)",
-              x: "iw/2-(iw/zoom/2)",
-              y: "ih/2-(ih/zoom/2)",
-              d: 1,
-              s: "1080x1920",
-              fps: 30,
-            },
-            inputs: "0:v",
-            outputs: "bgzoom",
-          },
-          {
-            filter: "boxblur",
-            options: "25:10",
-            inputs: "bgzoom",
-            outputs: "bgblur",
-          },
-          {
-            filter: "eq",
-            options: "brightness=-0.10:saturation=0.85",
-            inputs: "bgblur",
-            outputs: "bg",
-          },
-          {
-            filter: "scale",
-            options: "920:1600:force_original_aspect_ratio=decrease",
-            inputs: "1:v",
-            outputs: "fgscaled",
-          },
-          {
-            filter: "pad",
-            options: "920:1600:(ow-iw)/2:(oh-ih)/2:color=black@0.0",
-            inputs: "fgscaled",
-            outputs: "fg",
-          },
-          {
-            filter: "overlay",
-            options: "(W-w)/2:(H-h)/2",
-            inputs: ["bg", "fg"],
-            outputs: "composite",
-          },
-          {
-            filter: "format",
-            options: "yuv420p",
-            inputs: "composite",
-            outputs: "vfinal",
-          },
-        ])
-        .outputOptions([
-          "-map [vfinal]",
-          "-map 2:a:0",
-          "-c:v libx264",
-          "-preset medium",
-          "-crf 20",
-          "-r 30",
-          "-pix_fmt yuv420p",
-          "-c:a aac",
-          "-b:a 192k",
-          "-shortest",
-          "-movflags +faststart",
-        ])
-        .save(videoPath)
-        .on("end", resolve)
-        .on("error", reject);
-    });
+    const backgroundPath = getLocalBackgroundVideoPath();
+
+    if (backgroundPath) {
+      await renderWithLocalBackgroundVideo({
+        backgroundPath,
+        stillPath,
+        audioPath,
+        videoPath,
+      });
+    } else {
+      await renderWithCinematicStillBackground({
+        stillPath,
+        audioPath,
+        videoPath,
+      });
+    }
 
     const videoBuffer = fs.readFileSync(videoPath);
 
-    // 4) upload mp4
     const { error: uploadErr } = await supabase.storage
       .from(output.bucket)
       .upload(output.path, videoBuffer, {
@@ -283,7 +383,6 @@ app.post("/render-mp4", async (req, res) => {
 
     if (uploadErr) throw uploadErr;
 
-    // 5) signed URL 7 days
     const { data: signed, error: signErr } = await supabase.storage
       .from(output.bucket)
       .createSignedUrl(output.path, 60 * 60 * 24 * 7);
@@ -292,7 +391,6 @@ app.post("/render-mp4", async (req, res) => {
 
     const mp4Url = signed?.signedUrl || null;
 
-    // 6) insert asset (best-effort)
     try {
       await supabase.from("video_assets").insert({
         job_id: jobId,
@@ -303,12 +401,14 @@ app.post("/render-mp4", async (req, res) => {
         storage_path: output.path,
         public_url: mp4Url,
         meta: {
-          engine: "ffmpeg_presenter_cinematic_v2",
+          engine: backgroundPath
+            ? "ffmpeg_presenter_background_video_v1"
+            : "ffmpeg_presenter_cinematic_v2",
           size: "1080x1920",
           fps: 30,
           sourceImageContentType: imageMeta.contentType || null,
           sourceImageBytes: imageMeta.size || null,
-          motion: "background_slow_zoom",
+          backgroundMode: backgroundPath ? "local_video" : "cinematic_still_fallback",
         },
       });
     } catch {}
@@ -318,7 +418,7 @@ app.post("/render-mp4", async (req, res) => {
       mp4Url,
       debug: {
         source: "presenter_image",
-        style: "cinematic_background_motion",
+        backgroundMode: backgroundPath ? "local_video" : "cinematic_still_fallback",
         presenterImageUrlResolved: true,
         outputPath: output.path,
       },
