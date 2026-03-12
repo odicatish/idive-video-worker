@@ -20,22 +20,138 @@ function requireEnv(name) {
 }
 
 function getSupabaseAdmin() {
-  const url = requireEnv("SUPABASE_URL");
-  const key = requireEnv("SUPABASE_SERVICE_ROLE_KEY");
+  const url =
+    (process.env.SUPABASE_URL || "").trim() ||
+    (process.env.NEXT_PUBLIC_SUPABASE_URL || "").trim();
+  const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+
+  if (!url) throw new Error("Missing SUPABASE_URL");
+  if (!key) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
 
   return createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 }
 
-// 1x1 PNG negru (fără lavfi)
-const BLACK_PNG_BASE64 =
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO1k3u0AAAAASUVORK5CYII=";
-
 function getBearerToken(req) {
   const h = (req.headers.authorization || "").trim();
   const m = h.match(/^Bearer\s+(.+)$/i);
   return (m?.[1] || "").trim();
+}
+
+function guessImageExt(contentType, fallbackUrl = "") {
+  const ct = String(contentType || "").toLowerCase();
+
+  if (ct.includes("png")) return ".png";
+  if (ct.includes("jpeg") || ct.includes("jpg")) return ".jpg";
+  if (ct.includes("webp")) return ".webp";
+
+  const clean = String(fallbackUrl || "").split("?")[0].toLowerCase();
+  if (clean.endsWith(".png")) return ".png";
+  if (clean.endsWith(".jpg") || clean.endsWith(".jpeg")) return ".jpg";
+  if (clean.endsWith(".webp")) return ".webp";
+
+  return ".png";
+}
+
+function parseStorageRef(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return null;
+
+  if (/^https?:\/\//i.test(value)) {
+    return { type: "url", url: value };
+  }
+
+  const cleaned = value.replace(/^\/+/, "");
+
+  if (cleaned.startsWith("storage/v1/object/public/")) {
+    const rest = cleaned.replace(/^storage\/v1\/object\/public\//, "");
+    const parts = rest.split("/").filter(Boolean);
+    if (parts.length >= 2) {
+      return {
+        type: "storage",
+        bucket: parts[0],
+        objectPath: parts.slice(1).join("/"),
+      };
+    }
+  }
+
+  if (cleaned.startsWith("storage/v1/object/sign/")) {
+    const rest = cleaned.replace(/^storage\/v1\/object\/sign\//, "");
+    const parts = rest.split("/").filter(Boolean);
+    if (parts.length >= 2) {
+      return {
+        type: "storage",
+        bucket: parts[0],
+        objectPath: parts.slice(1).join("/"),
+      };
+    }
+  }
+
+  const parts = cleaned.split("/").filter(Boolean);
+
+  if (parts.length >= 2 && ["presenters", "renders", "images"].includes(parts[0])) {
+    return {
+      type: "storage",
+      bucket: parts[0],
+      objectPath: parts.slice(1).join("/"),
+    };
+  }
+
+  return {
+    type: "storage",
+    bucket: "presenters",
+    objectPath: cleaned,
+  };
+}
+
+async function getPresenterImageUrl(supabase, jobId) {
+  const { data: pipelineJob, error: jobErr } = await supabase
+    .from("video_render_jobs")
+    .select("id,presenter_id")
+    .eq("id", jobId)
+    .maybeSingle();
+
+  if (jobErr) throw new Error(`pipeline_job_load_failed: ${jobErr.message}`);
+  if (!pipelineJob?.presenter_id) throw new Error("pipeline_presenter_missing");
+
+  const { data: presenter, error: presenterErr } = await supabase
+    .from("presenters")
+    .select("id,image_path")
+    .eq("id", pipelineJob.presenter_id)
+    .maybeSingle();
+
+  if (presenterErr) throw new Error(`presenter_load_failed: ${presenterErr.message}`);
+  if (!presenter?.image_path) throw new Error("presenter_image_path_missing");
+
+  const ref = parseStorageRef(presenter.image_path);
+  if (!ref) throw new Error("presenter_image_ref_invalid");
+
+  if (ref.type === "url") {
+    return ref.url;
+  }
+
+  const { data: signed, error: signErr } = await supabase.storage
+    .from(ref.bucket)
+    .createSignedUrl(ref.objectPath, 60 * 60);
+
+  if (signErr) throw new Error(`presenter_image_sign_failed: ${signErr.message}`);
+  if (!signed?.signedUrl) throw new Error("presenter_image_signed_url_missing");
+
+  return signed.signedUrl;
+}
+
+async function downloadToFile(url, outPath) {
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    throw new Error(`download_failed_${resp.status}`);
+  }
+
+  const contentType = resp.headers.get("content-type") || "";
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  fs.writeFileSync(outPath, buffer);
+
+  return { contentType, size: buffer.length };
 }
 
 app.get("/", (req, res) => {
@@ -59,11 +175,11 @@ app.post("/render-mp4", async (req, res) => {
     const supabase = getSupabaseAdmin();
 
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "idive-video-"));
+
     const audioPath = path.join(tmpDir, "audio.mp3");
-    const stillPath = path.join(tmpDir, "black.png");
     const videoPath = path.join(tmpDir, "video.mp4");
 
-    // 1) download audio (folosim fetch global din Node 22)
+    // 1) download audio
     const audioResp = await fetch(audioUrl);
     if (!audioResp.ok) {
       return res.status(400).json({ error: `audio_download_failed_${audioResp.status}` });
@@ -71,10 +187,14 @@ app.post("/render-mp4", async (req, res) => {
     const audioBuffer = Buffer.from(await audioResp.arrayBuffer());
     fs.writeFileSync(audioPath, audioBuffer);
 
-    // 2) write black png
-    fs.writeFileSync(stillPath, Buffer.from(BLACK_PNG_BASE64, "base64"));
+    // 2) resolve presenter image from job -> presenter -> image_path
+    const presenterImageUrl = await getPresenterImageUrl(supabase, jobId);
+    const imageExt = guessImageExt("", presenterImageUrl);
+    const stillPath = path.join(tmpDir, `presenter${imageExt}`);
 
-    // 3) render mp4 (fără lavfi)
+    const imageMeta = await downloadToFile(presenterImageUrl, stillPath);
+
+    // 3) render mp4 from presenter still image + audio
     await new Promise((resolve, reject) => {
       ffmpeg()
         .input(stillPath)
@@ -83,7 +203,9 @@ app.post("/render-mp4", async (req, res) => {
         .outputOptions([
           "-c:v libx264",
           "-tune stillimage",
-          "-vf scale=1080:1080,format=yuv420p",
+          "-r 30",
+          "-vf scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p",
+          "-pix_fmt yuv420p",
           "-c:a aac",
           "-b:a 192k",
           "-shortest",
@@ -126,16 +248,29 @@ app.post("/render-mp4", async (req, res) => {
         storage_bucket: output.bucket,
         storage_path: output.path,
         public_url: mp4Url,
-        meta: { engine: "ffmpeg_stillimage_v2", size: "1080x1080", fps: 30 },
+        meta: {
+          engine: "ffmpeg_presenter_still_v1",
+          size: "1080x1920",
+          fps: 30,
+          sourceImageContentType: imageMeta.contentType || null,
+          sourceImageBytes: imageMeta.size || null,
+        },
       });
     } catch {}
 
-    return res.json({ ok: true, mp4Url });
+    return res.json({
+      ok: true,
+      mp4Url,
+      debug: {
+        source: "presenter_image",
+        presenterImageUrlResolved: true,
+        outputPath: output.path,
+      },
+    });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: e?.message || "internal_error" });
   } finally {
-    // cleanup best-effort
     try {
       if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
     } catch {}
