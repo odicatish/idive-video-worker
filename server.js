@@ -139,10 +139,64 @@ function getUseCaseFraming(useCase) {
   }
 }
 
+function getBillingPlanFromMeta(meta) {
+  const plan = String(meta?.billing?.plan || "").trim().toLowerCase();
+  if (plan === "pro" || plan === "business" || plan === "free") return plan;
+  return "free";
+}
+
+function shouldApplyWatermark(plan) {
+  return String(plan || "").toLowerCase() === "free";
+}
+
+function getWatermarkText() {
+  return "iDive AI";
+}
+
+function getWatermarkFilters(inputLabel, outputLabel, enabled) {
+  if (!enabled) {
+    return [
+      {
+        filter: "format",
+        options: "yuv420p",
+        inputs: inputLabel,
+        outputs: outputLabel,
+      },
+    ];
+  }
+
+  return [
+    {
+      filter: "drawtext",
+      options: {
+        text: getWatermarkText(),
+        fontsize: 28,
+        fontcolor: "white@0.88",
+        x: "w-tw-36",
+        y: "h-th-28",
+        box: 1,
+        boxcolor: "black@0.32",
+        boxborderw: 14,
+        shadowcolor: "black@0.35",
+        shadowx: 1,
+        shadowy: 1,
+      },
+      inputs: inputLabel,
+      outputs: "watermarked",
+    },
+    {
+      filter: "format",
+      options: "yuv420p",
+      inputs: "watermarked",
+      outputs: outputLabel,
+    },
+  ];
+}
+
 async function getPresenterRenderContext(supabase, jobId) {
   const { data: pipelineJob, error: jobErr } = await supabase
     .from("video_render_jobs")
-    .select("id,presenter_id")
+    .select("id,presenter_id,meta")
     .eq("id", jobId)
     .maybeSingle();
 
@@ -181,11 +235,15 @@ async function getPresenterRenderContext(supabase, jobId) {
       ? presenter.use_case.trim()
       : "business_spokesperson";
 
+  const billingPlan = getBillingPlanFromMeta(pipelineJob.meta);
+
   return {
     presenterId: pipelineJob.presenter_id,
     imageUrl,
     useCase,
     framing: getUseCaseFraming(useCase),
+    billingPlan,
+    watermarkEnabled: shouldApplyWatermark(billingPlan),
   };
 }
 
@@ -237,10 +295,51 @@ function renderWithLocalBackgroundVideo({
   audioPath,
   videoPath,
   framing,
+  watermarkEnabled,
 }) {
   const fgWidth = framing?.fgWidth ?? 920;
   const fgHeight = framing?.fgHeight ?? 1600;
   const yOffset = framing?.yOffset ?? 0;
+
+  const filterGraph = [
+    {
+      filter: "scale",
+      options: "1080:1920:force_original_aspect_ratio=increase",
+      inputs: "0:v",
+      outputs: "bgscaled",
+    },
+    {
+      filter: "crop",
+      options: "1080:1920",
+      inputs: "bgscaled",
+      outputs: "bgcropped",
+    },
+    {
+      filter: "eq",
+      options: "brightness=-0.08:saturation=0.90",
+      inputs: "bgcropped",
+      outputs: "bg",
+    },
+    {
+      filter: "scale",
+      options: `${fgWidth}:${fgHeight}:force_original_aspect_ratio=decrease`,
+      inputs: "1:v",
+      outputs: "fgscaled",
+    },
+    {
+      filter: "pad",
+      options: `${fgWidth}:${fgHeight}:(ow-iw)/2:(oh-ih)/2:color=black@0.0`,
+      inputs: "fgscaled",
+      outputs: "fg",
+    },
+    {
+      filter: "overlay",
+      options: `(W-w)/2:((H-h)/2)+${yOffset}`,
+      inputs: ["bg", "fg"],
+      outputs: "composite",
+    },
+    ...getWatermarkFilters("composite", "vfinal", watermarkEnabled),
+  ];
 
   return new Promise((resolve, reject) => {
     ffmpeg()
@@ -249,50 +348,7 @@ function renderWithLocalBackgroundVideo({
       .input(stillPath)
       .inputOptions(["-loop 1", "-framerate 30"])
       .input(audioPath)
-      .complexFilter([
-        {
-          filter: "scale",
-          options: "1080:1920:force_original_aspect_ratio=increase",
-          inputs: "0:v",
-          outputs: "bgscaled",
-        },
-        {
-          filter: "crop",
-          options: "1080:1920",
-          inputs: "bgscaled",
-          outputs: "bgcropped",
-        },
-        {
-          filter: "eq",
-          options: "brightness=-0.08:saturation=0.90",
-          inputs: "bgcropped",
-          outputs: "bg",
-        },
-        {
-          filter: "scale",
-          options: `${fgWidth}:${fgHeight}:force_original_aspect_ratio=decrease`,
-          inputs: "1:v",
-          outputs: "fgscaled",
-        },
-        {
-          filter: "pad",
-          options: `${fgWidth}:${fgHeight}:(ow-iw)/2:(oh-ih)/2:color=black@0.0`,
-          inputs: "fgscaled",
-          outputs: "fg",
-        },
-        {
-          filter: "overlay",
-          options: `(W-w)/2:((H-h)/2)+${yOffset}`,
-          inputs: ["bg", "fg"],
-          outputs: "composite",
-        },
-        {
-          filter: "format",
-          options: "yuv420p",
-          inputs: "composite",
-          outputs: "vfinal",
-        },
-      ])
+      .complexFilter(filterGraph)
       .outputOptions([
         "-map [vfinal]",
         "-map 2:a:0",
@@ -312,10 +368,63 @@ function renderWithLocalBackgroundVideo({
   });
 }
 
-function renderWithCinematicStillBackground({ stillPath, audioPath, videoPath, framing }) {
+function renderWithCinematicStillBackground({
+  stillPath,
+  audioPath,
+  videoPath,
+  framing,
+  watermarkEnabled,
+}) {
   const fgWidth = framing?.fgWidth ?? 920;
   const fgHeight = framing?.fgHeight ?? 1600;
   const yOffset = framing?.yOffset ?? 0;
+
+  const filterGraph = [
+    {
+      filter: "zoompan",
+      options: {
+        z: "min(zoom+0.00025,1.06)",
+        x: "iw/2-(iw/zoom/2)",
+        y: "ih/2-(ih/zoom/2)",
+        d: 1,
+        s: "1080x1920",
+        fps: 30,
+      },
+      inputs: "0:v",
+      outputs: "bgzoom",
+    },
+    {
+      filter: "boxblur",
+      options: "25:10",
+      inputs: "bgzoom",
+      outputs: "bgblur",
+    },
+    {
+      filter: "eq",
+      options: "brightness=-0.10:saturation=0.85",
+      inputs: "bgblur",
+      outputs: "bg",
+    },
+    {
+      filter: "scale",
+      options: `${fgWidth}:${fgHeight}:force_original_aspect_ratio=decrease`,
+      inputs: "1:v",
+      outputs: "fgscaled",
+    },
+    {
+      filter: "pad",
+      options: `${fgWidth}:${fgHeight}:(ow-iw)/2:(oh-ih)/2:color=black@0.0`,
+      inputs: "fgscaled",
+      outputs: "fg",
+    },
+    {
+      filter: "overlay",
+      options: `(W-w)/2:((H-h)/2)+${yOffset}`,
+      inputs: ["bg", "fg"],
+      outputs: "composite",
+    },
+    ...getWatermarkFilters("composite", "vfinal", watermarkEnabled),
+  ];
 
   return new Promise((resolve, reject) => {
     ffmpeg()
@@ -324,57 +433,7 @@ function renderWithCinematicStillBackground({ stillPath, audioPath, videoPath, f
       .input(stillPath)
       .inputOptions(["-loop 1", "-framerate 30"])
       .input(audioPath)
-      .complexFilter([
-        {
-          filter: "zoompan",
-          options: {
-            z: "min(zoom+0.00025,1.06)",
-            x: "iw/2-(iw/zoom/2)",
-            y: "ih/2-(ih/zoom/2)",
-            d: 1,
-            s: "1080x1920",
-            fps: 30,
-          },
-          inputs: "0:v",
-          outputs: "bgzoom",
-        },
-        {
-          filter: "boxblur",
-          options: "25:10",
-          inputs: "bgzoom",
-          outputs: "bgblur",
-        },
-        {
-          filter: "eq",
-          options: "brightness=-0.10:saturation=0.85",
-          inputs: "bgblur",
-          outputs: "bg",
-        },
-        {
-          filter: "scale",
-          options: `${fgWidth}:${fgHeight}:force_original_aspect_ratio=decrease`,
-          inputs: "1:v",
-          outputs: "fgscaled",
-        },
-        {
-          filter: "pad",
-          options: `${fgWidth}:${fgHeight}:(ow-iw)/2:(oh-ih)/2:color=black@0.0`,
-          inputs: "fgscaled",
-          outputs: "fg",
-        },
-        {
-          filter: "overlay",
-          options: `(W-w)/2:((H-h)/2)+${yOffset}`,
-          inputs: ["bg", "fg"],
-          outputs: "composite",
-        },
-        {
-          filter: "format",
-          options: "yuv420p",
-          inputs: "composite",
-          outputs: "vfinal",
-        },
-      ])
+      .complexFilter(filterGraph)
       .outputOptions([
         "-map [vfinal]",
         "-map 2:a:0",
@@ -440,6 +499,7 @@ app.post("/render-mp4", async (req, res) => {
         audioPath,
         videoPath,
         framing: renderCtx.framing,
+        watermarkEnabled: renderCtx.watermarkEnabled,
       });
     } else {
       await renderWithCinematicStillBackground({
@@ -447,6 +507,7 @@ app.post("/render-mp4", async (req, res) => {
         audioPath,
         videoPath,
         framing: renderCtx.framing,
+        watermarkEnabled: renderCtx.watermarkEnabled,
       });
     }
 
@@ -481,12 +542,15 @@ app.post("/render-mp4", async (req, res) => {
         public_url: mp4Url,
         meta: {
           engine: backgroundSelection.backgroundPath
-            ? "ffmpeg_presenter_background_video_v3"
-            : "ffmpeg_presenter_cinematic_v3",
+            ? "ffmpeg_presenter_background_video_v4"
+            : "ffmpeg_presenter_cinematic_v4",
           size: "1080x1920",
           fps: 30,
           useCase: renderCtx.useCase,
           framing: renderCtx.framing,
+          billingPlan: renderCtx.billingPlan,
+          watermarkEnabled: renderCtx.watermarkEnabled,
+          watermarkText: renderCtx.watermarkEnabled ? getWatermarkText() : null,
           sourceImageContentType: imageMeta.contentType || null,
           sourceImageBytes: imageMeta.size || null,
           backgroundMode: backgroundSelection.backgroundPath
@@ -505,6 +569,8 @@ app.post("/render-mp4", async (req, res) => {
         source: "presenter_image",
         useCase: renderCtx.useCase,
         framing: renderCtx.framing,
+        billingPlan: renderCtx.billingPlan,
+        watermarkEnabled: renderCtx.watermarkEnabled,
         backgroundMode: backgroundSelection.backgroundPath
           ? "use_case_video"
           : "cinematic_still_fallback",
