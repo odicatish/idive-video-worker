@@ -105,7 +105,7 @@ function parseStorageRef(raw) {
   };
 }
 
-async function getPresenterImageUrl(supabase, jobId) {
+async function getPresenterRenderContext(supabase, jobId) {
   const { data: pipelineJob, error: jobErr } = await supabase
     .from("video_render_jobs")
     .select("id,presenter_id")
@@ -117,7 +117,7 @@ async function getPresenterImageUrl(supabase, jobId) {
 
   const { data: presenter, error: presenterErr } = await supabase
     .from("presenters")
-    .select("id,image_path")
+    .select("id,image_path,use_case")
     .eq("id", pipelineJob.presenter_id)
     .maybeSingle();
 
@@ -127,18 +127,29 @@ async function getPresenterImageUrl(supabase, jobId) {
   const ref = parseStorageRef(presenter.image_path);
   if (!ref) throw new Error("presenter_image_ref_invalid");
 
+  let imageUrl = null;
+
   if (ref.type === "url") {
-    return ref.url;
+    imageUrl = ref.url;
+  } else {
+    const { data: signed, error: signErr } = await supabase.storage
+      .from(ref.bucket)
+      .createSignedUrl(ref.objectPath, 60 * 60);
+
+    if (signErr) throw new Error(`presenter_image_sign_failed: ${signErr.message}`);
+    if (!signed?.signedUrl) throw new Error("presenter_image_signed_url_missing");
+
+    imageUrl = signed.signedUrl;
   }
 
-  const { data: signed, error: signErr } = await supabase.storage
-    .from(ref.bucket)
-    .createSignedUrl(ref.objectPath, 60 * 60);
-
-  if (signErr) throw new Error(`presenter_image_sign_failed: ${signErr.message}`);
-  if (!signed?.signedUrl) throw new Error("presenter_image_signed_url_missing");
-
-  return signed.signedUrl;
+  return {
+    presenterId: pipelineJob.presenter_id,
+    imageUrl,
+    useCase:
+      typeof presenter.use_case === "string" && presenter.use_case.trim()
+        ? presenter.use_case.trim()
+        : "business_spokesperson",
+  };
 }
 
 async function downloadToFile(url, outPath) {
@@ -154,9 +165,33 @@ async function downloadToFile(url, outPath) {
   return { contentType, size: buffer.length };
 }
 
-function getLocalBackgroundVideoPath() {
-  const p = path.join(__dirname, "assets", "background.mp4");
-  return fs.existsSync(p) ? p : null;
+function getUseCaseBackgroundVideoPath(useCase) {
+  const safeUseCase =
+    typeof useCase === "string" && useCase.trim() ? useCase.trim() : "business_spokesperson";
+
+  const exact = path.join(__dirname, "assets", `${safeUseCase}.mp4`);
+  if (fs.existsSync(exact)) {
+    return {
+      backgroundPath: exact,
+      backgroundKey: safeUseCase,
+      resolvedFrom: "use_case",
+    };
+  }
+
+  const fallback = path.join(__dirname, "assets", "background.mp4");
+  if (fs.existsSync(fallback)) {
+    return {
+      backgroundPath: fallback,
+      backgroundKey: "background",
+      resolvedFrom: "default",
+    };
+  }
+
+  return {
+    backgroundPath: null,
+    backgroundKey: null,
+    resolvedFrom: "none",
+  };
 }
 
 function renderWithLocalBackgroundVideo({
@@ -235,11 +270,7 @@ function renderWithLocalBackgroundVideo({
   });
 }
 
-function renderWithCinematicStillBackground({
-  stillPath,
-  audioPath,
-  videoPath,
-}) {
+function renderWithCinematicStillBackground({ stillPath, audioPath, videoPath }) {
   return new Promise((resolve, reject) => {
     ffmpeg()
       .input(stillPath)
@@ -349,16 +380,16 @@ app.post("/render-mp4", async (req, res) => {
     const audioBuffer = Buffer.from(await audioResp.arrayBuffer());
     fs.writeFileSync(audioPath, audioBuffer);
 
-    const presenterImageUrl = await getPresenterImageUrl(supabase, jobId);
-    const imageExt = guessImageExt("", presenterImageUrl);
+    const renderCtx = await getPresenterRenderContext(supabase, jobId);
+    const imageExt = guessImageExt("", renderCtx.imageUrl);
     const stillPath = path.join(tmpDir, `presenter${imageExt}`);
-    const imageMeta = await downloadToFile(presenterImageUrl, stillPath);
+    const imageMeta = await downloadToFile(renderCtx.imageUrl, stillPath);
 
-    const backgroundPath = getLocalBackgroundVideoPath();
+    const backgroundSelection = getUseCaseBackgroundVideoPath(renderCtx.useCase);
 
-    if (backgroundPath) {
+    if (backgroundSelection.backgroundPath) {
       await renderWithLocalBackgroundVideo({
-        backgroundPath,
+        backgroundPath: backgroundSelection.backgroundPath,
         stillPath,
         audioPath,
         videoPath,
@@ -401,14 +432,19 @@ app.post("/render-mp4", async (req, res) => {
         storage_path: output.path,
         public_url: mp4Url,
         meta: {
-          engine: backgroundPath
-            ? "ffmpeg_presenter_background_video_v1"
+          engine: backgroundSelection.backgroundPath
+            ? "ffmpeg_presenter_background_video_v2"
             : "ffmpeg_presenter_cinematic_v2",
           size: "1080x1920",
           fps: 30,
+          useCase: renderCtx.useCase,
           sourceImageContentType: imageMeta.contentType || null,
           sourceImageBytes: imageMeta.size || null,
-          backgroundMode: backgroundPath ? "local_video" : "cinematic_still_fallback",
+          backgroundMode: backgroundSelection.backgroundPath
+            ? "use_case_video"
+            : "cinematic_still_fallback",
+          backgroundKey: backgroundSelection.backgroundKey,
+          backgroundResolvedFrom: backgroundSelection.resolvedFrom,
         },
       });
     } catch {}
@@ -418,7 +454,12 @@ app.post("/render-mp4", async (req, res) => {
       mp4Url,
       debug: {
         source: "presenter_image",
-        backgroundMode: backgroundPath ? "local_video" : "cinematic_still_fallback",
+        useCase: renderCtx.useCase,
+        backgroundMode: backgroundSelection.backgroundPath
+          ? "use_case_video"
+          : "cinematic_still_fallback",
+        backgroundKey: backgroundSelection.backgroundKey,
+        backgroundResolvedFrom: backgroundSelection.resolvedFrom,
         presenterImageUrlResolved: true,
         outputPath: output.path,
       },
