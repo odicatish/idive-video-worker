@@ -105,6 +105,40 @@ function parseStorageRef(raw) {
   };
 }
 
+function getUseCaseFraming(useCase) {
+  switch (useCase) {
+    case "sales_outreach":
+      return {
+        fgWidth: 980,
+        fgHeight: 1680,
+        yOffset: 40,
+        label: "direct_close",
+      };
+    case "founder_ceo":
+      return {
+        fgWidth: 900,
+        fgHeight: 1560,
+        yOffset: -40,
+        label: "elevated_leadership",
+      };
+    case "product_explainer":
+      return {
+        fgWidth: 860,
+        fgHeight: 1500,
+        yOffset: 10,
+        label: "clean_explainer",
+      };
+    case "business_spokesperson":
+    default:
+      return {
+        fgWidth: 920,
+        fgHeight: 1600,
+        yOffset: 0,
+        label: "balanced_premium",
+      };
+  }
+}
+
 async function getPresenterRenderContext(supabase, jobId) {
   const { data: pipelineJob, error: jobErr } = await supabase
     .from("video_render_jobs")
@@ -142,13 +176,16 @@ async function getPresenterRenderContext(supabase, jobId) {
     imageUrl = signed.signedUrl;
   }
 
+  const useCase =
+    typeof presenter.use_case === "string" && presenter.use_case.trim()
+      ? presenter.use_case.trim()
+      : "business_spokesperson";
+
   return {
     presenterId: pipelineJob.presenter_id,
     imageUrl,
-    useCase:
-      typeof presenter.use_case === "string" && presenter.use_case.trim()
-        ? presenter.use_case.trim()
-        : "business_spokesperson",
+    useCase,
+    framing: getUseCaseFraming(useCase),
   };
 }
 
@@ -199,7 +236,12 @@ function renderWithLocalBackgroundVideo({
   stillPath,
   audioPath,
   videoPath,
+  framing,
 }) {
+  const fgWidth = framing?.fgWidth ?? 920;
+  const fgHeight = framing?.fgHeight ?? 1600;
+  const yOffset = framing?.yOffset ?? 0;
+
   return new Promise((resolve, reject) => {
     ffmpeg()
       .input(backgroundPath)
@@ -228,19 +270,19 @@ function renderWithLocalBackgroundVideo({
         },
         {
           filter: "scale",
-          options: "920:1600:force_original_aspect_ratio=decrease",
+          options: `${fgWidth}:${fgHeight}:force_original_aspect_ratio=decrease`,
           inputs: "1:v",
           outputs: "fgscaled",
         },
         {
           filter: "pad",
-          options: "920:1600:(ow-iw)/2:(oh-ih)/2:color=black@0.0",
+          options: `${fgWidth}:${fgHeight}:(ow-iw)/2:(oh-ih)/2:color=black@0.0`,
           inputs: "fgscaled",
           outputs: "fg",
         },
         {
           filter: "overlay",
-          options: "(W-w)/2:(H-h)/2",
+          options: `(W-w)/2:((H-h)/2)+${yOffset}`,
           inputs: ["bg", "fg"],
           outputs: "composite",
         },
@@ -270,7 +312,11 @@ function renderWithLocalBackgroundVideo({
   });
 }
 
-function renderWithCinematicStillBackground({ stillPath, audioPath, videoPath }) {
+function renderWithCinematicStillBackground({ stillPath, audioPath, videoPath, framing }) {
+  const fgWidth = framing?.fgWidth ?? 920;
+  const fgHeight = framing?.fgHeight ?? 1600;
+  const yOffset = framing?.yOffset ?? 0;
+
   return new Promise((resolve, reject) => {
     ffmpeg()
       .input(stillPath)
@@ -306,19 +352,19 @@ function renderWithCinematicStillBackground({ stillPath, audioPath, videoPath })
         },
         {
           filter: "scale",
-          options: "920:1600:force_original_aspect_ratio=decrease",
+          options: `${fgWidth}:${fgHeight}:force_original_aspect_ratio=decrease`,
           inputs: "1:v",
           outputs: "fgscaled",
         },
         {
           filter: "pad",
-          options: "920:1600:(ow-iw)/2:(oh-ih)/2:color=black@0.0",
+          options: `${fgWidth}:${fgHeight}:(ow-iw)/2:(oh-ih)/2:color=black@0.0`,
           inputs: "fgscaled",
           outputs: "fg",
         },
         {
           filter: "overlay",
-          options: "(W-w)/2:(H-h)/2",
+          options: `(W-w)/2:((H-h)/2)+${yOffset}`,
           inputs: ["bg", "fg"],
           outputs: "composite",
         },
@@ -393,12 +439,14 @@ app.post("/render-mp4", async (req, res) => {
         stillPath,
         audioPath,
         videoPath,
+        framing: renderCtx.framing,
       });
     } else {
       await renderWithCinematicStillBackground({
         stillPath,
         audioPath,
         videoPath,
+        framing: renderCtx.framing,
       });
     }
 
@@ -433,11 +481,12 @@ app.post("/render-mp4", async (req, res) => {
         public_url: mp4Url,
         meta: {
           engine: backgroundSelection.backgroundPath
-            ? "ffmpeg_presenter_background_video_v2"
-            : "ffmpeg_presenter_cinematic_v2",
+            ? "ffmpeg_presenter_background_video_v3"
+            : "ffmpeg_presenter_cinematic_v3",
           size: "1080x1920",
           fps: 30,
           useCase: renderCtx.useCase,
+          framing: renderCtx.framing,
           sourceImageContentType: imageMeta.contentType || null,
           sourceImageBytes: imageMeta.size || null,
           backgroundMode: backgroundSelection.backgroundPath
@@ -455,6 +504,7 @@ app.post("/render-mp4", async (req, res) => {
       debug: {
         source: "presenter_image",
         useCase: renderCtx.useCase,
+        framing: renderCtx.framing,
         backgroundMode: backgroundSelection.backgroundPath
           ? "use_case_video"
           : "cinematic_still_fallback",
