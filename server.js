@@ -187,24 +187,78 @@ app.post("/render-mp4", async (req, res) => {
     const audioBuffer = Buffer.from(await audioResp.arrayBuffer());
     fs.writeFileSync(audioPath, audioBuffer);
 
-    // 2) resolve presenter image from job -> presenter -> image_path
+    // 2) resolve presenter image
     const presenterImageUrl = await getPresenterImageUrl(supabase, jobId);
     const imageExt = guessImageExt("", presenterImageUrl);
     const stillPath = path.join(tmpDir, `presenter${imageExt}`);
-
     const imageMeta = await downloadToFile(presenterImageUrl, stillPath);
 
-    // 3) render mp4 from presenter still image + audio
+    // 3) render mp4 with cinematic background + subtle motion
     await new Promise((resolve, reject) => {
       ffmpeg()
         .input(stillPath)
         .inputOptions(["-loop 1", "-framerate 30"])
+        .input(stillPath)
+        .inputOptions(["-loop 1", "-framerate 30"])
         .input(audioPath)
+        .complexFilter([
+          {
+            filter: "zoompan",
+            options: {
+              z: "min(zoom+0.00025,1.06)",
+              x: "iw/2-(iw/zoom/2)",
+              y: "ih/2-(ih/zoom/2)",
+              d: 1,
+              s: "1080x1920",
+              fps: 30,
+            },
+            inputs: "0:v",
+            outputs: "bgzoom",
+          },
+          {
+            filter: "boxblur",
+            options: "25:10",
+            inputs: "bgzoom",
+            outputs: "bgblur",
+          },
+          {
+            filter: "eq",
+            options: "brightness=-0.10:saturation=0.85",
+            inputs: "bgblur",
+            outputs: "bg",
+          },
+          {
+            filter: "scale",
+            options: "920:1600:force_original_aspect_ratio=decrease",
+            inputs: "1:v",
+            outputs: "fgscaled",
+          },
+          {
+            filter: "pad",
+            options: "920:1600:(ow-iw)/2:(oh-ih)/2:color=black@0.0",
+            inputs: "fgscaled",
+            outputs: "fg",
+          },
+          {
+            filter: "overlay",
+            options: "(W-w)/2:(H-h)/2",
+            inputs: ["bg", "fg"],
+            outputs: "composite",
+          },
+          {
+            filter: "format",
+            options: "yuv420p",
+            inputs: "composite",
+            outputs: "vfinal",
+          },
+        ])
         .outputOptions([
+          "-map [vfinal]",
+          "-map 2:a:0",
           "-c:v libx264",
-          "-tune stillimage",
+          "-preset medium",
+          "-crf 20",
           "-r 30",
-          "-vf scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p",
           "-pix_fmt yuv420p",
           "-c:a aac",
           "-b:a 192k",
@@ -249,11 +303,12 @@ app.post("/render-mp4", async (req, res) => {
         storage_path: output.path,
         public_url: mp4Url,
         meta: {
-          engine: "ffmpeg_presenter_still_v1",
+          engine: "ffmpeg_presenter_cinematic_v2",
           size: "1080x1920",
           fps: 30,
           sourceImageContentType: imageMeta.contentType || null,
           sourceImageBytes: imageMeta.size || null,
+          motion: "background_slow_zoom",
         },
       });
     } catch {}
@@ -263,6 +318,7 @@ app.post("/render-mp4", async (req, res) => {
       mp4Url,
       debug: {
         source: "presenter_image",
+        style: "cinematic_background_motion",
         presenterImageUrlResolved: true,
         outputPath: output.path,
       },
