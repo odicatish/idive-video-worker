@@ -196,7 +196,7 @@ function getWatermarkFilters(inputLabel, outputLabel, enabled) {
 async function getPresenterRenderContext(supabase, jobId) {
   const { data: pipelineJob, error: jobErr } = await supabase
     .from("video_render_jobs")
-    .select("id,presenter_id,meta")
+    .select("id,presenter_id")
     .eq("id", jobId)
     .maybeSingle();
 
@@ -205,7 +205,7 @@ async function getPresenterRenderContext(supabase, jobId) {
 
   const { data: presenter, error: presenterErr } = await supabase
     .from("presenters")
-    .select("id,image_path,use_case")
+    .select("id,image_path,use_case,context")
     .eq("id", pipelineJob.presenter_id)
     .maybeSingle();
 
@@ -235,7 +235,7 @@ async function getPresenterRenderContext(supabase, jobId) {
       ? presenter.use_case.trim()
       : "business_spokesperson";
 
-  const billingPlan = getBillingPlanFromMeta(pipelineJob.meta);
+  const billingPlan = "free";
 
   return {
     presenterId: pipelineJob.presenter_id,
